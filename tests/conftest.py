@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from payments.config import Settings
 from payments.database import Database
@@ -36,6 +37,9 @@ def payment_request() -> PaymentCreate:
 async def db(settings: Settings) -> AsyncIterator[Database]:
     if not os.getenv("TEST_DATABASE_URL"):
         pytest.skip("Set TEST_DATABASE_URL to a dedicated migrated test database")
+    name = make_url(settings.database_url.get_secret_value()).database
+    if name is None or not name.endswith("_test"):
+        pytest.fail("TEST_DATABASE_URL must point to a database with a name ending in _test")
     database = Database(settings)
     async with database.sessions.begin() as session:
         await session.execute(text("TRUNCATE outbox, payments"))

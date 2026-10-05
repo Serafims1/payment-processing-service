@@ -149,3 +149,32 @@ async def test_parallel_relays_do_not_claim_same_event(db, repository, payment_r
     message = await queue.get(timeout=2)
     await message.ack()
     assert await queue.get(fail=False) is None
+
+
+async def test_crash_after_publish_before_mark_allows_redelivery(
+    db, repository, payment_request, broker, monkeypatch
+):
+    from datetime import timedelta
+
+    from sqlalchemy import update
+
+    from payments.models import utcnow
+
+    await repository.create("crash-window", payment_request)
+    outbox = OutboxRepository(db.sessions)
+    real_complete = outbox.complete
+    monkeypatch.setattr(outbox, "complete", AsyncMock(side_effect=RuntimeError("crash")))
+    with pytest.raises(RuntimeError, match="crash"):
+        await Relay(outbox, broker, 0).once()
+    async with db.sessions.begin() as session:
+        event = await session.scalar(select(Outbox))
+        assert event.published_at is None
+        assert event.leased_until is not None
+        await session.execute(update(Outbox).values(leased_until=utcnow() - timedelta(seconds=1)))
+    monkeypatch.setattr(outbox, "complete", real_complete)
+    assert await Relay(outbox, broker, 0).once()
+    queue = await broker.declare_queue(QUEUE)
+    messages = [await queue.get(timeout=2), await queue.get(timeout=2)]
+    assert messages[0].body == messages[1].body
+    for message in messages:
+        await message.ack()

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from uuid import UUID
@@ -53,16 +54,27 @@ async def worker(settings: Settings, gateway: Gateway | None = None) -> AsyncIte
                     await task
                 await broker.stop()
     finally:
+        if task is None:
+            await broker.stop()
         await db.close()
 
 
 async def run() -> None:
-    async with worker(Settings()):
-        await asyncio.Event().wait()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    try:
+        async with worker(Settings()):
+            await stop.wait()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         asyncio.run(run())
     except KeyboardInterrupt:

@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -7,6 +7,6 @@ class Settings(BaseSettings):
     api_key: SecretStr
     database_url: SecretStr
     rabbitmq_url: SecretStr
-    webhook_timeout: float = 5
-    retry_base: float = 1
-    relay_interval: float = 1
+    webhook_timeout: float = Field(default=5, gt=0)
+    retry_base: float = Field(default=1, ge=0)
+    relay_interval: float = Field(default=1, gt=0)

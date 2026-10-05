@@ -68,7 +68,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         code = 404 if isinstance(exc, PaymentNotFound) else 409
         if not isinstance(exc, (PaymentNotFound, IdempotencyConflict)):
             code = 500
-        return JSONResponse(status_code=code, content={"detail": str(exc)})
+        if code == 500:
+            logger.error("Unexpected application error", exc_info=exc)
+        message = str(exc) if code != 500 else "Internal server error"
+        return JSONResponse(status_code=code, content={"detail": message})
 
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:

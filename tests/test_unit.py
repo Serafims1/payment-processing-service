@@ -154,3 +154,19 @@ async def test_gateway_cancellation():
     sleep = AsyncMock(side_effect=asyncio.CancelledError)
     with pytest.raises(asyncio.CancelledError):
         await Gateway(sleep).process()
+
+
+async def test_resumed_webhook_uses_remaining_budget_only():
+    repo = AsyncMock(spec=PaymentRepository)
+    item = payment("failed")
+    item.webhook_attempts = 1
+    repo.get.return_value = item
+    repo.begin_attempt.side_effect = [2, 3]
+    webhook = AsyncMock(spec=WebhookClient)
+    webhook.send.side_effect = [httpx.ReadTimeout("timeout"), None]
+    gateway = AsyncMock(spec=Gateway)
+    sleep = AsyncMock()
+    await Processor(repo, gateway, webhook, sleep=sleep).process(item.id)
+    assert webhook.send.await_count == 2
+    assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
+    gateway.process.assert_not_awaited()
