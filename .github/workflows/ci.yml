@@ -33,6 +33,9 @@ jobs:
       TEST_RABBITMQ_URL: amqp://payments:test-password@localhost:5672/
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14.8'
       - uses: astral-sh/setup-uv@v7
         with:
           version: '0.11.6'
