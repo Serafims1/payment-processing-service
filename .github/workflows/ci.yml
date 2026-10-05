@@ -1,0 +1,65 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-bookworm
+        env:
+          POSTGRES_USER: payments
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: payments_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U payments -d payments_test"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+      rabbitmq:
+        image: rabbitmq:4.3.6-management
+        env:
+          RABBITMQ_DEFAULT_USER: payments
+          RABBITMQ_DEFAULT_PASS: test-password
+        ports: [5672:5672]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      API_KEY: test-api-key
+      DATABASE_URL: postgresql+asyncpg://payments:test-password@localhost:5432/payments_test
+      RABBITMQ_URL: amqp://payments:test-password@localhost:5672/
+      TEST_DATABASE_URL: postgresql+asyncpg://payments:test-password@localhost:5432/payments_test
+      TEST_RABBITMQ_URL: amqp://payments:test-password@localhost:5672/
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.11.6'
+          python-version: '3.14.8'
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run alembic upgrade head
+      - run: make check
+      - run: uv run alembic check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+  docker-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cp .env.example .env
+      - run: docker compose up --build -d --wait
+      - run: docker compose cp tools/e2e.py api:/tmp/e2e.py
+      - run: docker compose exec -T api python /tmp/e2e.py
+      - run: docker compose stop rabbitmq
+      - run: docker compose exec -T api python /tmp/e2e.py outage-create
+      - run: docker compose start rabbitmq
+      - run: docker compose exec -T api python /tmp/e2e.py outage-check
+      - run: docker compose logs --no-color
+        if: failure()
+      - run: docker compose down
+        if: always()

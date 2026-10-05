@@ -15,6 +15,7 @@ security:
 complexity:
 	$(UV) run radon cc src -s -n C
 	$(UV) run radon mi src -s
+	$(UV) run python tools/check_complexity.py
 test:
 	$(UV) run pytest
 test-cov:
