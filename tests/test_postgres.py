@@ -135,3 +135,82 @@ async def test_real_api_lifecycle_health_idempotency(db, settings, payment_reque
                 )
             ).status_code == 409
     assert await counts(db) == (1, 1)
+
+
+@pytest.mark.parametrize("first,second", [(True, 1), (False, 0), (1, True)])
+async def test_idempotency_distinguishes_json_booleans_from_numbers(
+    db, settings, payment_request, first, second
+):
+    app = create_app(settings)
+    headers = {"X-API-Key": "test-api-key", "Idempotency-Key": "json-types"}
+    body = payment_request.model_dump(mode="json")
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        created = await client.post(
+            "/api/v1/payments", headers=headers, json=body | {"metadata": {"nested": [first]}}
+        )
+        conflict = await client.post(
+            "/api/v1/payments", headers=headers, json=body | {"metadata": {"nested": [second]}}
+        )
+    assert created.status_code == 202
+    assert conflict.status_code == 409
+    assert await counts(db) == (1, 1)
+
+
+async def test_idempotency_accepts_reordered_json_and_equivalent_numbers(
+    db, repository, payment_request
+):
+    first = PaymentCreate.model_validate(
+        payment_request.model_dump() | {"metadata": {"x": 1, "y": [None, {"z": True}]}}
+    )
+    second = PaymentCreate.model_validate(
+        payment_request.model_dump()
+        | {"amount": "12.3", "metadata": {"y": [None, {"z": True}], "x": 1.0}}
+    )
+    created = await repository.create("equivalent-json", first)
+    duplicate = await repository.create("equivalent-json", second)
+    assert duplicate.id == created.id
+    assert await counts(db) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"metadata": {"v": "bad\x00value"}},
+        {"metadata": {"bad\x00key": 1}},
+        {"metadata": {"nested": [{"v": "\ud800"}]}},
+        {"metadata": {"v": float("nan")}},
+        {"metadata": {"nested": [float("inf")]}},
+        {"description": "bad\x00value"},
+        {"description": "\udfff"},
+        {"amount": float("nan")},
+        {"metadata": {"\ud800": float("nan")}},
+    ],
+)
+async def test_invalid_storage_input_returns_422_without_writes(
+    db, settings, payment_request, change
+):
+    import json
+
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client,
+    ):
+        result = await client.post(
+            "/api/v1/payments",
+            headers={
+                "X-API-Key": "test-api-key",
+                "Idempotency-Key": "invalid-storage",
+                "Content-Type": "application/json",
+            },
+            content=json.dumps(payment_request.model_dump(mode="json") | change),
+        )
+    assert result.status_code == 422
+    assert "traceback" not in result.text.lower()
+    assert await counts(db) == (0, 0)

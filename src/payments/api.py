@@ -1,3 +1,4 @@
+import json
 import logging
 import secrets
 from collections.abc import AsyncIterator
@@ -6,7 +7,8 @@ from typing import Annotated, cast
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
 
 from payments.config import Settings
@@ -54,6 +56,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await db.close()
 
     app = FastAPI(title="Payment processing", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> Response:
+        # Invalid input can contain NaN or lone surrogates; don't echo it into a JSON response.
+        errors = [{key: error[key] for key in ("loc", "msg", "type")} for error in exc.errors()]
+        return Response(
+            content=json.dumps({"detail": errors}, ensure_ascii=True),
+            status_code=422,
+            media_type="application/json",
+        )
 
     async def authenticate(x_api_key: Annotated[str | None, Header()] = None) -> None:
         if x_api_key is None or not secrets.compare_digest(

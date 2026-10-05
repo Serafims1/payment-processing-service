@@ -36,6 +36,7 @@ backoff (по умолчанию 1 секунда), `RELAY_INTERVAL` — пау�
 Все `/api/v1/payments` endpoints требуют `X-API-Key`. Для POST также нужен
 `Idempotency-Key` (1–200 символов). Сумма — положительная decimal-строка, максимум
 18 цифр до точки и 2 после; JSON float отклоняется. Валюты: RUB, USD, EUR.
+`metadata` — JSON-объект с конечными числами; текст должен быть UTF-8 без NUL.
 
 ```bash
 export API_KEY=local-development-key-change-me
@@ -64,7 +65,8 @@ Webhook содержит `payment_id`, `status`, `amount`, `currency`, `processe
 
 - Routes отвечают за HTTP; service оркестрирует persistence; SQL находится в repositories.
 - PostgreSQL UNIQUE — окончательная защита от конкурентных POST. После IntegrityError
-  транзакция откатывается, существующий нормализованный payload сравнивается структурно.
+  транзакция откатывается, нормализованный payload сравнивается через JSONB equality
+  (boolean отличается от number; порядок ключей и числовой scale не влияют).
   Payment и единственное Outbox-событие создаются атомарно.
 - Relay выбирает событие `FOR UPDATE SKIP LOCKED`, фиксирует lease на 30 секунд и завершает
   DB-транзакцию **до** RabbitMQ publish. Durable exchange `payments`, routing key/очередь

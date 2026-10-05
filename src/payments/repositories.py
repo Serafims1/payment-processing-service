@@ -47,12 +47,18 @@ class PaymentRepository:
                         )
                     )
             except IntegrityError:
-                existing = await session.scalar(
-                    select(Payment).where(Payment.idempotency_key == key)
-                )
-                if existing is None:
+                row = (
+                    await session.execute(
+                        select(Payment, Payment.request_payload == payload).where(
+                            Payment.idempotency_key == key
+                        )
+                    )
+                ).one_or_none()
+                if row is None:
                     raise
-                if existing.request_payload != payload:
+                existing, matches = row
+                # JSONB equality keeps booleans distinct from numbers, including nested values.
+                if not matches:
                     raise IdempotencyConflict("Idempotency key payload mismatch") from None
                 return existing
         return payment
