@@ -178,3 +178,53 @@ async def test_crash_after_publish_before_mark_allows_redelivery(
     assert messages[0].body == messages[1].body
     for message in messages:
         await message.ack()
+
+
+async def test_cancelled_webhook_requeues_terminal_payment_without_gateway_replay(
+    db, repository, payment_request, settings, broker, webhook_server, monkeypatch
+):
+    from payments.processing import WebhookClient
+
+    request = PaymentCreate.model_validate(
+        payment_request.model_dump() | {"webhook_url": webhook_server["url"]}
+    )
+    payment = await repository.create("cancelled-webhook", request)
+    gateway = AsyncMock(spec=Gateway)
+    gateway.process.return_value = "failed"
+    interrupted = asyncio.Event()
+    original_send = WebhookClient.send
+
+    async def interrupt_first(client, item):
+        if not interrupted.is_set():
+            interrupted.set()
+            raise asyncio.CancelledError
+        await original_send(client, item)
+
+    monkeypatch.setattr(WebhookClient, "send", interrupt_first)
+    settings.relay_interval = 0.02
+    async with worker(settings, gateway):
+        async with asyncio.timeout(5):
+            await interrupted.wait()
+        saved = await repository.get(payment.id)
+        assert saved.status == "failed"
+        assert saved.processed_at is not None
+        assert saved.webhook_attempts == 1
+        assert saved.webhook_delivered_at is None
+    queue = await broker.declare_queue(QUEUE)
+    redelivery = await queue.get(timeout=2)
+    assert redelivery.redelivered
+    assert json.loads(redelivery.body)["payment_id"] == str(payment.id)
+    await redelivery.reject(requeue=True)
+    async with worker(settings, gateway):
+
+        async def delivered():
+            return (await repository.get(payment.id)).webhook_delivered_at is not None
+
+        await wait_for(delivered)
+    final = await repository.get(payment.id)
+    assert final.status == saved.status
+    assert final.processed_at == saved.processed_at
+    assert final.webhook_attempts == 2
+    assert len(webhook_server["requests"]) == 1
+    gateway.process.assert_awaited_once()
+    assert db.engine.pool.checkedout() == 0
