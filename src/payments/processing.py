@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 
 from payments.exceptions import DeliveryExhausted
 from payments.models import Payment
@@ -62,6 +63,19 @@ class Processor:
         self.sleep = sleep
 
     async def process(self, payment_id: UUID) -> None:
+        for attempt in range(1, 4):
+            try:
+                await self.process_once(payment_id)
+                return
+            except SQLAlchemyError:
+                logger.exception(
+                    "Database processing error payment=%s attempt=%s", payment_id, attempt
+                )
+                if attempt == 3:
+                    raise
+                await self.sleep(self.retry_base * 2 ** (attempt - 1))
+
+    async def process_once(self, payment_id: UUID) -> None:
         payment = await self.repository.get(payment_id)
         if payment.status == "pending":
             status = await self.gateway.process()

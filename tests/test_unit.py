@@ -170,3 +170,25 @@ async def test_resumed_webhook_uses_remaining_budget_only():
     assert webhook.send.await_count == 2
     assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
     gateway.process.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failures", [2, 3])
+async def test_transient_database_errors_have_bounded_backoff(failures):
+    from sqlalchemy.exc import OperationalError
+
+    repo = AsyncMock(spec=PaymentRepository)
+    item = payment("succeeded")
+    item.webhook_delivered_at = utcnow()
+    error = OperationalError("SELECT", {}, ConnectionError("database unavailable"))
+    repo.get.side_effect = [error] * failures + [item]
+    sleep = AsyncMock()
+    gateway = AsyncMock(spec=Gateway)
+    processor = Processor(repo, gateway, AsyncMock(spec=WebhookClient), sleep=sleep)
+    if failures == 3:
+        with pytest.raises(OperationalError):
+            await processor.process(item.id)
+    else:
+        await processor.process(item.id)
+    assert repo.get.await_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
+    gateway.process.assert_not_awaited()
