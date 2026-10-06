@@ -1,8 +1,7 @@
 # Асинхронный процессинг платежей
 
-FastAPI API принимает платёж, PostgreSQL сохраняет Payment и Outbox одной транзакцией.
-Relay публикует событие в RabbitMQ; consumer эмулирует gateway (2–5 секунд, 90% успеха),
-сохраняет результат и отправляет HTTP webhook.
+Flow: POST → Payment + Transactional Outbox в PostgreSQL → RabbitMQ → consumer →
+gateway (2–5 секунд, 90% успеха) → succeeded/failed → HTTP webhook → retry/DLQ.
 
 Стек: Python 3.14, FastAPI/Pydantic v2, SQLAlchemy async/asyncpg, PostgreSQL 18,
 Alembic, FastStream/RabbitMQ 4, httpx, uv. Точные зависимости закреплены в `uv.lock`;
@@ -19,21 +18,20 @@ docker compose up --build -d --wait
 curl http://localhost:8000/health
 ```
 
-Миграции применяет одноразовый сервис `migrate` до запуска API/consumer.
-Данные PostgreSQL и RabbitMQ сохраняются в volumes. Остановка без удаления данных:
+Alembic-миграции применяет сервис `migrate` до запуска API/consumer.
+Данные сохраняются в volumes. Остановка без удаления данных:
 `docker compose down`. Swagger: http://localhost:8000/docs.
 
-`.env.example` содержит все переменные. `API_KEY`, `DATABASE_URL`, `RABBITMQ_URL`
-обязательны; URL при локальном запуске используют localhost, Compose подставляет
-имена сервисов. `WEBHOOK_TIMEOUT` — timeout HTTP в секундах, `RETRY_BASE` — основание
-backoff (по умолчанию 1 секунда), `RELAY_INTERVAL` — пауза между опросами Outbox.
-`POSTGRES_*` и `RABBITMQ_DEFAULT_*` задают credentials контейнеров. Это значения
-для разработки; `.env` не хранится в Git. При смене паролей существующие volumes
-не переинициализируются. Пароли в connection URL должны быть URL-encoded.
+Все переменные перечислены в `.env.example`: обязательные `API_KEY`, `DATABASE_URL`,
+`RABBITMQ_URL`; `WEBHOOK_TIMEOUT` (секунды), `RETRY_BASE` (backoff, по умолчанию 1 секунда),
+`RELAY_INTERVAL` (опрос Outbox); credentials `POSTGRES_*` и `RABBITMQ_DEFAULT_*`.
+Локальные URL используют localhost, Compose подставляет имена сервисов.
+`.env` исключён из Git. Пароли в URL требуют URL-encoding; смена credentials
+не переинициализирует существующие volumes.
 
 ## API
 
-Все `/api/v1/payments` endpoints требуют `X-API-Key`. Для POST также нужен
+Endpoints `/api/v1/payments` требуют `X-API-Key`, POST — также
 `Idempotency-Key` (1–200 символов). Сумма — положительная decimal-строка, максимум
 18 цифр до точки и 2 после; JSON float отклоняется. Валюты: RUB, USD, EUR.
 `metadata` — JSON-объект с конечными числами; текст должен быть UTF-8 без NUL.
@@ -50,46 +48,36 @@ curl http://localhost:8000/api/v1/payments/PAYMENT_UUID \
   -H "X-API-Key: $API_KEY"
 ```
 
-POST возвращает 202 с `payment_id`, `status`, `created_at`. GET возвращает детали,
-включая `processed_at`. Даты timezone-aware UTC, денежные значения в ответах — строки.
-Повторный POST с тем же ключом и эквивалентным payload возвращает существующий платёж
-и его текущий статус. Другой payload с тем же ключом → 409; отсутствующий платёж → 404;
-неверный/отсутствующий API key → 401; ошибки body/Idempotency-Key → 422.
+POST → 202 с `payment_id`, `status`, `created_at`; GET → детали, включая `processed_at`.
+Даты — timezone-aware UTC, суммы — строки. Повтор ключа с эквивалентным payload
+возвращает тот же платёж и текущий статус; другой payload → 409.
+Неизвестный платёж → 404; неверный/отсутствующий API key → 401;
+ошибки body/Idempotency-Key → 422.
 
 Webhook содержит `payment_id`, `status`, `amount`, `currency`, `processed_at`.
-Заголовок `Idempotency-Key` webhook равен payment UUID: получатель должен дедуплицировать
-доставки. URL должен быть доступен **из consumer-контейнера**, localhost означает сам
-контейнер. Gateway-отказ — нормальный terminal status `failed`, также доставляемый клиенту.
+Его `Idempotency-Key` равен payment UUID для дедупликации получателем.
+URL должен быть доступен **из consumer-контейнера**: localhost означает сам контейнер.
+Gateway-отказ (`failed`) также доставляется клиенту.
 
 ## Гарантии и решения
 
-- Routes отвечают за HTTP; service оркестрирует persistence; SQL находится в repositories.
-- PostgreSQL UNIQUE — окончательная защита от конкурентных POST. После IntegrityError
-  транзакция откатывается, нормализованный payload сравнивается через JSONB equality
-  (boolean отличается от number; порядок ключей и числовой scale не влияют).
-  Payment и единственное Outbox-событие создаются атомарно.
-- Relay выбирает событие `FOR UPDATE SKIP LOCKED`, фиксирует lease на 30 секунд и завершает
-  DB-транзакцию **до** RabbitMQ publish. Durable exchange `payments`, routing key/очередь
-  `payments.new`; persistent messages, mandatory routing и publisher confirms.
-  `published_at` записывается только после подтверждения. Ошибка освобождает lease;
-  crash оставляет событие доступным после истечения lease. Устаревший lease token
-  не может завершить новую отправку. Несколько relay допустимы.
-- Outbox — at-least-once: crash между publish и DB update допускает дубль. RabbitMQ
-  `x-single-active-consumer` и prefetch=1 обеспечивают одного последовательного consumer.
-  Terminal status неизменяем; duplicate delivery продолжает только незавершённый webhook.
-  Во время gateway, HTTP, backoff и publish нет открытых DB-транзакций.
-- Webhook: timeout, non-2xx/network errors, максимум **3 попытки total** с backoff 1/2 секунды.
-  Счётчик сохраняется **до** HTTP, поэтому restart не обнуляет бюджет. Crash после резервирования
-  попытки может израсходовать её без доставки; это сознательный компромисс строгого лимита.
-  После исчерпания consumer rejects без requeue; DLX `payments.dlx` направляет сообщение
-  с routing key `payments.dead` в durable `payments.dlq`. Временные ошибки PostgreSQL
-  повторяются до 3 раз с backoff; webhook остаётся ограничен своим сохранённым бюджетом.
-  Unexpected processing errors также
-  попадают в DLQ, логируются и требуют диагностики/replay оператором.
-- Webhook — at-least-once, не exactly-once: crash после успешного HTTP и до записи в БД
-  допускает повтор. Terminal payment сохраняется даже при неудаче webhook.
-- API продолжает принимать платежи при недоступном RabbitMQ; consumer/relay восстанавливают
-  соединение. Health API проверяет PostgreSQL. Graceful SIGTERM закрывает задачи и соединения.
+- Payment и единственное Outbox-событие создаются атомарно. PostgreSQL UNIQUE защищает
+  от конкурентных POST; эквивалентность нормализованного payload проверяется через JSONB.
+- Relay использует `SKIP LOCKED` и 30-секундный lease: несколько relay допустимы,
+  после crash событие снова доступно. Persistent-сообщения идут через durable exchange
+  `payments` в `payments.new`; mandatory routing и publisher confirms предшествуют
+  записи `published_at`. DB-транзакции не удерживаются во время внешних вызовов/backoff.
+- Outbox и webhook — **at-least-once**: crash между отправкой и фиксацией в БД допускает
+  дубль. Single-active-consumer и prefetch=1 обеспечивают последовательную обработку.
+  Terminal status неизменяем; повторная доставка продолжает только незавершённый webhook.
+- Webhook: максимум **3 попытки total**, backoff 1/2 секунды при timeout, non-2xx/network
+  errors. Счётчик сохраняется до HTTP и переживает restart; crash может израсходовать
+  попытку без доставки. После исчерпания — reject без requeue, DLX `payments.dlx` →
+  `payments.dead` → durable `payments.dlq`; terminal payment сохраняется.
+  Временные ошибки PostgreSQL повторяются до 3 раз. Неожиданные processing errors
+  логируются и также направляются в DLQ.
+- При недоступном RabbitMQ API принимает платежи; consumer/relay восстанавливают соединение.
+  `/health` проверяет PostgreSQL; SIGTERM закрывает задачи и соединения.
 
 ## Разработка и проверки
 
@@ -107,9 +95,8 @@ Unit/API tests не требуют инфраструктуры:
 uv run pytest -m 'not integration'
 ```
 
-Для полного gate нужна **отдельная** PostgreSQL база с именем, заканчивающимся на `_test`,
-и отдельный RabbitMQ vhost. Тесты очищают Payment/Outbox и очереди этого vhost.
-Не запускайте их против работающего приложения. Например, после остановки consumer:
+Полный gate требует **отдельную** PostgreSQL базу с суффиксом `_test` и RabbitMQ vhost:
+тесты очищают их таблицы и очереди. Пример с credentials из `.env.example`:
 
 ```bash
 docker compose stop consumer
@@ -125,12 +112,11 @@ docker compose start consumer
 ```
 
 `make check`: Ruff lint/format, strict mypy, Bandit, Radon (complexity A/B,
-maintainability A с проверяемым порогом), pytest/coverage >=80%.
-`make format`, `make test`, `make test-cov`, `make up/down` доступны отдельно.
-Без `TEST_*` integration tests явно skipped; полноценный gate требует обе переменные.
-CI запускает их с реальными PostgreSQL/RabbitMQ и отдельно проверяет Docker/E2E.
+maintainability A), pytest/coverage >=80%. Отдельно доступны `make format`,
+`make test`, `make test-cov`, `make up/down`. Без `TEST_*` integration tests skipped.
+CI проверяет полный gate с PostgreSQL/RabbitMQ и Docker/E2E.
 
-Воспроизводимый E2E на Compose, с настоящим gateway и локальным HTTP-получателем:
+E2E на Compose с настоящим gateway и HTTP-получателем:
 
 ```bash
 docker compose cp tools/e2e.py api:/tmp/e2e.py
@@ -141,17 +127,15 @@ docker compose start rabbitmq
 docker compose exec -T api python /tmp/e2e.py outage-check
 ```
 
-Проверяются POST→Outbox→RabbitMQ→consumer→webhook→GET, idempotency/conflict/auth,
-retry, DLQ, duplicate delivery и сохранность Outbox при реальной остановке брокера.
-E2E создаёт диагностические платежи; для повторного outage сценария используйте чистую
-тестовую среду (фиксированный ключ `outage-e2e`).
+Проверяются полный flow, idempotency/auth, retry/DLQ, duplicate delivery и Outbox recovery.
+E2E создаёт диагностические платежи; повторный outage требует чистой среды
+из-за фиксированного ключа `outage-e2e`.
 
 ## Ограничения
 
-Gateway — эмулятор. Crash до фиксации terminal status может повторить эмуляцию;
-реальный gateway обязан принимать idempotency key. Последовательный consumer ограничивает
-пропускную способность; RabbitMQ single-active-consumer не заменяет gateway idempotency
-при сетевых разделениях. DLQ нужно мониторить и разбирать; автоматического replay нет.
-Очистка старых Outbox-событий, TLS, секреты, метрики и webhook signatures — production hardening.
-Обычная URL validation **не защищает полностью от SSRF**: перед публичным production
-развёртыванием нужны ограничения исходящего трафика/адресов и проверка DNS.
+Gateway — эмулятор; crash до фиксации результата допускает повтор. Реальному gateway
+нужен idempotency key, в том числе при сетевых разделениях. Последовательный consumer
+ограничивает throughput. DLQ требует мониторинга и ручного replay.
+Очистка Outbox, TLS, секреты, метрики и webhook signatures — production hardening.
+URL validation **не защищает полностью от SSRF**: нужны ограничения исходящего
+трафика/адресов и проверка DNS.
