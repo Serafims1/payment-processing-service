@@ -13,19 +13,31 @@ Docker использует Python 3.14.8, PostgreSQL 18.6, RabbitMQ 4.3.6 и uv
 
 ```bash
 cp .env.example .env
-# Замените API_KEY и локальные пароли в .env.
+```
+
+Замените `API_KEY` и пароли в `.env`. Запуск:
+
+```bash
 docker compose up --build -d --wait
+```
+
+Health:
+
+```bash
 curl http://localhost:8000/health
 ```
 
-Alembic-миграции применяет сервис `migrate` до запуска API/consumer.
-Данные сохраняются в volumes. Остановка без удаления данных:
-`docker compose down`. Swagger: http://localhost:8000/docs.
+[Swagger](http://localhost:8000/docs). `migrate` применяет миграции до запуска API/consumer.
+Остановка; данные остаются в volumes:
 
-Все переменные перечислены в `.env.example`: обязательные `API_KEY`, `DATABASE_URL`,
+```bash
+docker compose down
+```
+
+Переменные в `.env.example`: обязательные `API_KEY`, `DATABASE_URL`,
 `RABBITMQ_URL`; `WEBHOOK_TIMEOUT` (секунды), `RETRY_BASE` (backoff, по умолчанию 1 секунда),
 `RELAY_INTERVAL` (опрос Outbox); credentials `POSTGRES_*` и `RABBITMQ_DEFAULT_*`.
-Локальные URL используют localhost, Compose подставляет имена сервисов.
+URL: локально localhost, в Compose — имена сервисов.
 `.env` исключён из Git. Пароли в URL требуют URL-encoding; смена credentials
 не переинициализирует существующие volumes.
 
@@ -36,14 +48,26 @@ Endpoints `/api/v1/payments` требуют `X-API-Key`, POST — также
 18 цифр до точки и 2 после; JSON float отклоняется. Валюты: RUB, USD, EUR.
 `metadata` — JSON-объект с конечными числами; текст должен быть UTF-8 без NUL.
 
+POST:
+
 ```bash
 export API_KEY=local-development-key-change-me
 curl -i http://localhost:8000/api/v1/payments \
   -H "X-API-Key: $API_KEY" \
   -H 'Idempotency-Key: order-42' \
   -H 'Content-Type: application/json' \
-  -d '{"amount":"199.90","currency":"RUB","description":"Order 42","metadata":{"order_id":42},"webhook_url":"https://example.org/payments/webhook"}'
+  -d '{
+    "amount":"199.90",
+    "currency":"RUB",
+    "description":"Order 42",
+    "metadata":{"order_id":42},
+    "webhook_url":"https://example.org/payments/webhook"
+  }'
+```
 
+GET:
+
+```bash
 curl http://localhost:8000/api/v1/payments/PAYMENT_UUID \
   -H "X-API-Key: $API_KEY"
 ```
@@ -70,8 +94,8 @@ Gateway-отказ (`failed`) также доставляется клиенту
 - Outbox и webhook — **at-least-once**: crash между отправкой и фиксацией в БД допускает
   дубль. Single-active-consumer и prefetch=1 обеспечивают последовательную обработку.
   Terminal status неизменяем; повторная доставка продолжает только незавершённый webhook.
-- Webhook: максимум **3 попытки total**, backoff 1/2 секунды при timeout, non-2xx/network
-  errors. Счётчик сохраняется до HTTP и переживает restart; crash может израсходовать
+- Webhook: всего **3 попытки**, backoff 1/2 секунды при timeout, non-2xx или сетевых
+  ошибках. Счётчик сохраняется до HTTP и переживает restart; crash может израсходовать
   попытку без доставки. После исчерпания — reject без requeue, DLX `payments.dlx` →
   `payments.dead` → durable `payments.dlq`; terminal payment сохраняется.
   Временные ошибки PostgreSQL повторяются до 3 раз. Неожиданные processing errors
@@ -82,21 +106,38 @@ Gateway-отказ (`failed`) также доставляется клиенту
 ## Разработка и проверки
 
 ```bash
-make install                    # uv sync --frozen; Python 3.14
-make migrate                    # DATABASE_URL из .env
+make install  # uv sync --frozen; Python 3.14
+make migrate  # DATABASE_URL из .env
 uv run uvicorn payments.api:create_app --factory --reload
-# Отдельный терминал:
+```
+
+Consumer (другой терминал):
+
+```bash
 uv run python -m payments.consumer
 ```
 
-Unit/API tests не требуют инфраструктуры:
+Unit/API tests без инфраструктуры:
 
 ```bash
 uv run pytest -m 'not integration'
 ```
 
-Полный gate требует **отдельную** PostgreSQL базу с суффиксом `_test` и RabbitMQ vhost:
-тесты очищают их таблицы и очереди. Пример с credentials из `.env.example`:
+Ruff lint/format, strict mypy, Bandit, Radon (complexity A/B,
+maintainability A), pytest/coverage >=80%:
+
+```bash
+make check
+```
+
+Без `TEST_*` integration tests пропускаются. CI проверяет полный gate с PostgreSQL/RabbitMQ и Docker/E2E.
+Цели Makefile: `format`, `test`, `test-cov`, `up`, `down`.
+
+<details>
+<summary>Ручная настройка integration tests</summary>
+
+**Отдельные** PostgreSQL база (суффикс `_test`) и RabbitMQ vhost.
+Тесты очищают таблицы и очереди. Пример с `.env.example`:
 
 ```bash
 docker compose stop consumer
@@ -111,12 +152,12 @@ DATABASE_URL="$TEST_DATABASE_URL" uv run alembic check
 docker compose start consumer
 ```
 
-`make check`: Ruff lint/format, strict mypy, Bandit, Radon (complexity A/B,
-maintainability A), pytest/coverage >=80%. Отдельно доступны `make format`,
-`make test`, `make test-cov`, `make up/down`. Без `TEST_*` integration tests skipped.
-CI проверяет полный gate с PostgreSQL/RabbitMQ и Docker/E2E.
+</details>
 
-E2E на Compose с настоящим gateway и HTTP-получателем:
+<details>
+<summary>E2E на Docker Compose</summary>
+
+Gateway и HTTP-получатель:
 
 ```bash
 docker compose cp tools/e2e.py api:/tmp/e2e.py
@@ -127,9 +168,11 @@ docker compose start rabbitmq
 docker compose exec -T api python /tmp/e2e.py outage-check
 ```
 
-Проверяются полный flow, idempotency/auth, retry/DLQ, duplicate delivery и Outbox recovery.
+Проверки: полный flow, idempotency/auth, retry/DLQ, duplicate delivery и Outbox recovery.
 E2E создаёт диагностические платежи; повторный outage требует чистой среды
 из-за фиксированного ключа `outage-e2e`.
+
+</details>
 
 ## Ограничения
 
